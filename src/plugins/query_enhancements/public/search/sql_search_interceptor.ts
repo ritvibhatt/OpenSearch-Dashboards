@@ -103,6 +103,9 @@ export class SQLSearchInterceptor extends SearchInterceptor {
       return nextQuery;
     }
 
+    // Allow time filters for all SQL queries, including histogram queries
+    // Histogram queries are structured with subqueries that need time filtering
+
     const timeRange = this.queryService.timefilter.timefilter.getTime();
     const { fromDate, toDate } = formatTimePickerDate(timeRange, 'YYYY-MM-DD HH:mm:ss.SSS');
     // Wrap the time literals in `TIMESTAMP('...')` rather than emitting bare string literals.

@@ -44,6 +44,8 @@ import { defaultPreparePplQuery } from '../../languages';
 import {
   HistogramConfig,
   buildPPLHistogramQuery,
+  buildSQLHistogramQuery,
+  buildSQLTopBreakdownQuery,
   processRawResultsForHistogram,
   createHistogramConfigWithInterval,
 } from './utils';
@@ -278,7 +280,6 @@ export const executeQueries = createAsyncThunk<
     dataTableQueryStatus?.status === QueryExecutionStatus.UNINITIALIZED;
   const needsHistogramQuery =
     query.language !== 'PROMQL' &&
-    query.language !== 'SQL' && // Disable histograms for SQL
     (!results[histogramCacheKey] ||
       histogramQueryStatus?.status === QueryExecutionStatus.UNINITIALIZED);
   const promises = [];
@@ -550,6 +551,32 @@ const executeQueryBase = async (
     let effectiveQuery = queryString;
     if (query.language === 'PPL' && histogramConfig && isHistogramQuery && supportsPplSpan) {
       effectiveQuery = buildPPLHistogramQuery(queryString, histogramConfig);
+    } else if (query.language === 'SQL' && histogramConfig && isHistogramQuery) {
+      let breakdownValues: Array<string | number> | undefined;
+      // Two-pass breakdown: pass 1 finds the top-N breakdown values at query
+      // time (matching PPL's `timechart limit=4`), pass 2 restricts the
+      // histogram to them. If pass 1 fails, fall back to an unfiltered
+      // breakdown rather than dropping the histogram entirely.
+      if (histogramConfig.breakdownField) {
+        try {
+          const topBreakdownQuery = buildSQLTopBreakdownQuery(queryString, histogramConfig);
+          const topBreakdownSource = await createSearchSourceWithQuery(
+            { ...query, dataset, query: topBreakdownQuery },
+            dataView,
+            services,
+            false
+          );
+          const topBreakdownResults = await topBreakdownSource.fetch({
+            abortSignal: abortController.signal,
+          });
+          breakdownValues = (topBreakdownResults.hits?.hits || [])
+            .map((hit: any) => hit._source?.breakdown)
+            .filter((value: any) => value !== undefined && value !== null);
+        } catch (e) {
+          breakdownValues = undefined;
+        }
+      }
+      effectiveQuery = buildSQLHistogramQuery(queryString, histogramConfig, breakdownValues);
     }
 
     const preparedQueryObject = {
@@ -616,22 +643,25 @@ const executeQueryBase = async (
 
     if (isHistogramQuery && histogramConfig) {
       rawResultsWithMeta = processRawResultsForHistogram(
-        queryString,
+        effectiveQuery,
         rawResultsWithMeta,
-        histogramConfig
+        histogramConfig,
+        query.language === 'SQL'
       );
     }
 
     dispatch(setResults({ cacheKey, results: rawResultsWithMeta }));
 
+    // For histogram queries, check total hits count instead of raw hits array length
+    const hasResults = isHistogramQuery
+      ? (rawResultsWithMeta.hits?.total || 0) > 0
+      : (rawResults.hits?.hits?.length || 0) > 0;
+
     dispatch(
       setIndividualQueryStatus({
         cacheKey,
         status: {
-          status:
-            rawResults.hits?.hits?.length > 0
-              ? QueryExecutionStatus.READY
-              : QueryExecutionStatus.NO_RESULTS,
+          status: hasResults ? QueryExecutionStatus.READY : QueryExecutionStatus.NO_RESULTS,
           startTime: queryStartTime,
           elapsedMs: inspectorRequest.getTime()!,
           error: undefined,
